@@ -1,187 +1,217 @@
 #include "application.h"
 
-// See
-// hal/src/stm32f2xx/adc_hal.c
-// hal/src/stm32f2xx/spi_hal.c
-// hal/src/stm32/pwm_hal.c
-// hal/src/stm32f2xx/pinmap_hal.c
+#define d2r (3.14159265/180)
 
-#define PIXEL_FREQUENCY 800000
-#define PIXEL_0_HIGH_DC 20
-#define PIXEL_1_HIGH_DC 80
+// Use update signal
+// PAP: This is better than the CC1 signal; using the CC1 signal causes the timing to shift
+#define PWM_TIMER	TIM3
+#define DMA_STREAM	DMA1_Stream2
+#define DMA_TCIF	DMA_FLAG_TCIF2
+#define DMA_CHANNEL	DMA_Channel_5
+#define DMA_SOURCE	TIM_DMA_Update
 
-uint16_t pixel_0_pulse, pixel_1_pulse;
 
-// Hard code TIM5 for now
-auto timerPeripheral = TIM5;
-auto timerPeripheralEnable = RCC_APB1Periph_TIM5;
-auto timerChannel = TIM_Channel_1;
-auto timerPulseRegister = &timerPeripheral->CCR1;
-auto timerPinFunction = GPIO_AF_TIM1;
+#define TIM_PERIOD			74
+#define TIM_COMPARE_HIGH	60
+#define TIM_COMPARE_LOW		15
 
-// DMA1, channel 2 for TIM4
-auto dmaPeripheralEnable = RCC_AHB1Periph_DMA1;
-auto dmaChannel = DMA_Channel_6;
-auto dmaStream = DMA1_Stream6;
-auto dmaSource = TIM_DMA_Update;
-auto dmaFinishFlag = DMA_FLAG_TCIF6;
 
-// Use A7 as output (GPIOA, GPIO_Pin_0)
-pin_t outputPin = A7;
-auto pinPeripheralEnable = RCC_AHB1Periph_GPIOA;
+TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
+TIM_OCInitTypeDef  TIM_OCInitStructure;
+GPIO_InitTypeDef GPIO_InitStructure;
+DMA_InitTypeDef DMA_InitStructure;
 
-uint32_t pixels[] = {
-    0xFF0000,
-    0xFFFF00,
-    0xFF00FF,
-    0x00FF00,
-    0x00FFFF,
-    0x0000FF
-};
+/* Buffer that holds one complete DMA transmission
+ * 
+ * Ensure that this buffer is big enough to hold
+ * all data bytes that need to be sent
+ * 
+ * The buffer size can be calculated as follows:
+ * number of LEDs * 24 bytes + 42 bytes
+ * 
+ * This leaves us with a maximum string length of
+ * (2^16 bytes per DMA stream - 42 bytes)/24 bytes per LED = 2728 LEDs
+ */
+uint16_t LED_BYTE_Buffer[100];	
 
-const auto pixelCount = sizeof(pixels) / sizeof(pixels[0]);
-const auto bitsPerPixel = 24;
-const auto bitCount = pixelCount * bitsPerPixel;
+void Timer3_init(void)
+{
+	uint16_t PrescalerValue;
+	
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB, ENABLE);
+	/* GPIOB Configuration: PWM_TIMER Channel 1 as alternate function push-pull */
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4;
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF;
+	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+	GPIO_Init(GPIOB, &GPIO_InitStructure);
+	GPIO_PinAFConfig(GPIOB, GPIO_PinSource4, GPIO_AF_TIM3);
+	
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
+	/* Compute the prescaler value */
+	RCC_ClocksTypeDef clocks;
+	RCC_GetClocksFreq(&clocks);
+	PrescalerValue = 0;
+	/* Time base configuration */
+	TIM_TimeBaseStructure.TIM_Period = TIM_PERIOD; // 800kHz 
+	TIM_TimeBaseStructure.TIM_Prescaler = PrescalerValue;
+	TIM_TimeBaseStructure.TIM_ClockDivision = 0;
+	TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+	TIM_TimeBaseInit(PWM_TIMER, &TIM_TimeBaseStructure);
 
-const auto pulseCount = bitCount + 1; // extra pulse will be 0
-uint16_t ledPulses[pulseCount];
+	/* PWM1 Mode configuration: Channel1 */
+	TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;
+	TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
+	TIM_OCInitStructure.TIM_Pulse = 0;
+	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;
+	TIM_OC1Init(PWM_TIMER, &TIM_OCInitStructure);
+	TIM_OC1PreloadConfig(PWM_TIMER, TIM_OCPreload_Enable);
 
-void initializeTimer() {
-    // Connect pin to timer
-    auto &pinMap = PIN_MAP[outputPin];
-    RCC_AHB1PeriphClockCmd(pinPeripheralEnable, ENABLE);
-    GPIO_InitTypeDef GPIO_InitStructure = { 0 };
-    GPIO_InitStructure.GPIO_Pin = pinMap.gpio_pin;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF;
-    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(pinMap.gpio_peripheral, &GPIO_InitStructure);
+	/* configure DMA */
+	/* DMA clock enable */
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_DMA1, ENABLE);
+	
+	/* DMA1 Channel6 Config */
+	DMA_DeInit(DMA_STREAM);
 
-    GPIO_PinAFConfig(pinMap.gpio_peripheral, pinMap.gpio_pin_source, timerPinFunction);
+	DMA_InitStructure.DMA_BufferSize = 42;
+	DMA_InitStructure.DMA_Channel = DMA_CHANNEL;
+	DMA_InitStructure.DMA_DIR = DMA_DIR_MemoryToPeripheral;					// data shifted from memory to peripheral
+	DMA_InitStructure.DMA_FIFOMode = DMA_FIFOMode_Disable;
+	DMA_InitStructure.DMA_FIFOThreshold = DMA_FIFOThreshold_HalfFull;
 
-    // Enable TIM5 clock
-    RCC_APB1PeriphClockCmd(timerPeripheralEnable, ENABLE);
+	DMA_InitStructure.DMA_Memory0BaseAddr = (uint32_t)&LED_BYTE_Buffer;		// this is the buffer memory 
+	DMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_HalfWord;
+	DMA_InitStructure.DMA_MemoryInc = DMA_MemoryInc_Enable;					// automatically increase buffer index
+	DMA_InitStructure.DMA_MemoryBurst = DMA_MemoryBurst_Single;
 
-    // for TIM5
-    uint32_t clock = SystemCoreClock / 2;
+	DMA_InitStructure.DMA_Mode = DMA_Mode_Normal;							// stop DMA feed after buffer size is reached
 
-    uint16_t period = (uint16_t)(clock / PIXEL_FREQUENCY) - 1;
-    pixel_0_pulse = period * PIXEL_0_HIGH_DC;
-    pixel_1_pulse = period * PIXEL_1_HIGH_DC;
+	DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)&PWM_TIMER->CCR1;	// physical address of Timer 3 CCR1
+	DMA_InitStructure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_HalfWord;
+	DMA_InitStructure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
+	DMA_InitStructure.DMA_PeripheralBurst = DMA_PeripheralBurst_Single;
 
-    // Time base configuration
-    TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure = { 0 };
-    TIM_TimeBaseStructure.TIM_Period = period;
-    TIM_TimeBaseStructure.TIM_Prescaler = 0; // full speed clock
-    TIM_TimeBaseStructure.TIM_ClockDivision = 0;
-    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
-    TIM_TimeBaseInit(timerPeripheral, &TIM_TimeBaseStructure);
+	DMA_InitStructure.DMA_Priority = DMA_Priority_High;
+	
+	DMA_Init(DMA_STREAM, &DMA_InitStructure);
+	
+	/* PWM_TIMER CC1 DMA Request enable */
+	TIM_DMACmd(PWM_TIMER, DMA_SOURCE, ENABLE);
+}
 
-    // Configure PWM
-    TIM_OCInitTypeDef TIM_OCInitStructure = { 0 };
-    TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;
-    TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
-    TIM_OCInitStructure.TIM_Pulse = 0;
-    TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;
+/* This function sends data bytes out to a string of WS2812s
+ * The first argument is a pointer to the first RGB triplet to be sent
+ * The seconds argument is the number of LEDs in the chain
+ * 
+ * This will result in the RGB triplet passed by argument 1 being sent to 
+ * the LED that is the furthest away from the controller (the point where
+ * data is injected into the chain)
+ */
+void WS2812_send(const uint8_t *color, const uint16_t _len)
+{
+	int i, j;
+	uint8_t led;
+	uint16_t memaddr;
+	uint16_t buffersize;
+	uint16_t len = _len;
 
-    switch(timerChannel) {
-      case TIM_Channel_1:
-        TIM_OC1Init(timerPeripheral, &TIM_OCInitStructure);
-        TIM_OC1PreloadConfig(timerPeripheral, TIM_OCPreload_Enable);
-        break;
-      case TIM_Channel_2:
-        TIM_OC2Init(timerPeripheral, &TIM_OCInitStructure);
-        TIM_OC2PreloadConfig(timerPeripheral, TIM_OCPreload_Enable);
-        break;
-      case TIM_Channel_3:
-        TIM_OC3Init(timerPeripheral, &TIM_OCInitStructure);
-        TIM_OC3PreloadConfig(timerPeripheral, TIM_OCPreload_Enable);
-        break;
-      case TIM_Channel_4:
-        TIM_OC4Init(timerPeripheral, &TIM_OCInitStructure);
-        TIM_OC4PreloadConfig(timerPeripheral, TIM_OCPreload_Enable);
-        break;
-    }
+	// Byte order mapping. 0 is red, 1 is green, 2 is blue
+	const uint8_t pix_map[3] = {0, 2, 1};
+
+	buffersize = (len*24)+42;	// number of bytes needed is #LEDs * 24 bytes + 42 trailing bytes
+	memaddr = 0;				// reset buffer memory index
+	led = 0;					// reset led index
+
+	// fill transmit buffer with correct compare values to achieve
+	// correct pulse widths according to color values
+	while (len)
+	{
+		for (i = 0; i < 3; i++)
+		{
+			for (j = 0; j < 8; j++)					// GREEN data
+			{
+				if ( (color[3*led + pix_map[i]]<<j) & 0x80 )	// data sent MSB first, j = 0 is MSB j = 7 is LSB
+				{
+					LED_BYTE_Buffer[memaddr] = TIM_COMPARE_HIGH;	// compare value for logical 1
+				}
+				else
+				{
+					LED_BYTE_Buffer[memaddr] = TIM_COMPARE_LOW;		// compare value for logical 0
+				}
+				memaddr++;
+			}
+		}
+		
+		led++;
+		len--;
+	}
+	
+	// add needed delay at end of byte cycle, pulsewidth = 0
+	while(memaddr < buffersize)
+	{
+		LED_BYTE_Buffer[memaddr] = 0;
+		memaddr++;
+	}
+
+	DMA_SetCurrDataCounter(DMA_STREAM, buffersize); 	// load number of bytes to be transferred
+
+	// PAP: Clear the timer's counter and set the compare value to 0. This
+	// sets the output low on start and gives us a full cycle to set up DMA.
+	TIM_SetCounter(PWM_TIMER, 0);
+	TIM_SetCompare1(PWM_TIMER, 0);
+	TIM_Cmd(PWM_TIMER, ENABLE); 						// enable Timer 3
+	
+	// PAP: Start DMA transfer after starting the timer. This prevents the
+	// DMA/PWM from dropping the first bit.
+	DMA_Cmd(DMA_STREAM, ENABLE); 			// enable DMA channel 6
+	while(!DMA_GetFlagStatus(DMA_STREAM, DMA_TCIF)); 	// wait until transfer complete
+	TIM_Cmd(PWM_TIMER, DISABLE); 					// disable Timer 3
+	DMA_Cmd(DMA_STREAM, DISABLE); 			// disable DMA channel 6
+	DMA_ClearFlag(DMA_STREAM, DMA_TCIF); 				// clear DMA1 Channel 6 transfer complete flag
 }
 
 
-void initializeDMA() {
-    RCC_AHB1PeriphClockCmd(dmaPeripheralEnable, ENABLE);
+void blend(const uint8_t *colourA, const uint8_t *colourB, uint8_t *colourOut, float amount)
+{
+	float r, g, b;
 
-    DMA_InitTypeDef DMA_InitStructure;
+	r = ((float)colourB[0] * amount) + ((float)colourA[0] * (1.0 - amount));
+	g = ((float)colourB[1] * amount) + ((float)colourA[1] * (1.0 - amount));
+	b = ((float)colourB[2] * amount) + ((float)colourA[2] * (1.0 - amount));
 
-    DMA_DeInit(dmaStream);
-
-    DMA_StructInit(&DMA_InitStructure);
-
-    DMA_InitStructure.DMA_BufferSize = 42;
-    DMA_InitStructure.DMA_Channel = dmaChannel;
-    DMA_InitStructure.DMA_DIR = DMA_DIR_MemoryToPeripheral;
-    DMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_HalfWord;
-    DMA_InitStructure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_HalfWord;
-
-    DMA_InitStructure.DMA_Memory0BaseAddr = (uint32_t)&ledPulses;
-    DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)timerPulseRegister;
-    DMA_InitStructure.DMA_MemoryInc = DMA_MemoryInc_Enable;
-    DMA_InitStructure.DMA_Priority = DMA_Priority_High;
-
-    DMA_Init(dmaStream, &DMA_InitStructure);
-
-    TIM_DMACmd(timerPeripheral, dmaSource, ENABLE);
+	colourOut[0] = (r > 255.0) ? 255.0 : (r < 0.0) ? 0.0 : r;
+	colourOut[1] = (g > 255.0) ? 255.0 : (g < 0.0) ? 0.0 : g;
+	colourOut[2] = (b > 255.0) ? 255.0 : (b < 0.0) ? 0.0 : b;
 }
 
-// Fill an array with the pulse times
-void fillBits() {
-    uint16_t bit = 0;
-    for(uint16_t i = 0; i < pixelCount; i++) {
-        for(uint32_t mask = 0x800000; mask != 0; mask >>= 1) {
-            ledPulses[bit] = (pixels[i] & mask) ? pixel_1_pulse : pixel_0_pulse;
-            bit++;
-        }
-    }
+const uint8_t off[3]	= {0,0,0};
+const uint8_t red[3]	= {255,0,0};
+const uint8_t green[3]	= {0,255,0};
+const uint8_t blue[3]	= {0,0,255};
+const uint8_t white[3]	= {255,255,255};
 
-    // Put back pulse to 0 at the end
-    ledPulses[bit] = 0;
-}
-
-void send() {
-    DMA_SetCurrDataCounter(dmaStream, pulseCount);
-    TIM_SetCounter(timerPeripheral, 0);
-    TIM_SetCompare1(timerPeripheral, 0);
-    TIM_Cmd(timerPeripheral, ENABLE);
-
-    DMA_Cmd(dmaStream, ENABLE);
-}
 
 void setup() {
-    Serial.begin(9600);
-    pinMode(D7, OUTPUT);
-    digitalWrite(D7, LOW);
-
-    pinMode(A7, OUTPUT);
-    analogWrite(A7, 50);
-
-    initializeTimer();
-    initializeDMA();
-
-    fillBits();
-    send();
+    Timer3_init();
 }
 
 void loop() {
-    Serial.printlnf("%d", DMA_GetCurrDataCounter(dmaStream));
+	int i, j;
+    const uint8_t *order[] = {
+        red,
+        green,
+        blue
+    };
 
-    /*
-  *          9. To control DMA events you can use one of the following
-  *              two methods:
-  *               a- Check on DMA Stream flags using the function DMA_GetFlagStatus().
-  *               b- Use DMA interrupts through the function DMA_ITConfig() at initialization
-  *                  phase and DMA_GetITStatus() function into interrupt routines in
-  *                  communication phase.
-  *              After checking on a flag you should clear it using DMA_ClearFlag()
-  *              function. And after checking on an interrupt event you should
-  *              clear it using DMA_ClearITPendingBit() function.
-     */
-    if(DMA_GetFlagStatus(dmaStream, dmaFinishFlag)) {
-        digitalWrite(D7, HIGH);
+    // Blend colours
+    const int MAXJ = (sizeof(order)/sizeof(order[0]));
+    for (j = 0; j < MAXJ; j++) {
+        for (i=0; i<100; i++) {
+            uint8_t colourbuf[3];
+            int k = (j == MAXJ-1) ? 0 : j+1;
+            blend(order[j], order[k], colourbuf, ((float)i) / 100.0);
+            WS2812_send(colourbuf, 1);
+            delay(100);
+        }
     }
 }
