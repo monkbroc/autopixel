@@ -4,10 +4,10 @@
 
 // Use update signal
 // PAP: This is better than the CC1 signal; using the CC1 signal causes the timing to shift
-#define PWM_TIMER	TIM3
-#define DMA_STREAM	DMA1_Stream2
-#define DMA_TCIF	DMA_FLAG_TCIF2
-#define DMA_CHANNEL	DMA_Channel_5
+#define PWM_TIMER	TIM5
+#define DMA_STREAM	DMA1_Stream6
+#define DMA_TCIF	DMA_FLAG_TCIF6
+#define DMA_CHANNEL	DMA_Channel_6
 #define DMA_SOURCE	TIM_DMA_Update
 
 
@@ -32,21 +32,21 @@ DMA_InitTypeDef DMA_InitStructure;
  * This leaves us with a maximum string length of
  * (2^16 bytes per DMA stream - 42 bytes)/24 bytes per LED = 2728 LEDs
  */
-uint16_t LED_BYTE_Buffer[100];	
+uint32_t LED_BYTE_Buffer[100];	
 
 void Timer3_init(void)
 {
 	uint16_t PrescalerValue;
 	
-	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB, ENABLE);
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOA, ENABLE);
 	/* GPIOB Configuration: PWM_TIMER Channel 1 as alternate function push-pull */
-	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4;
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_0;
 	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF;
 	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-	GPIO_Init(GPIOB, &GPIO_InitStructure);
-	GPIO_PinAFConfig(GPIOB, GPIO_PinSource4, GPIO_AF_TIM3);
+	GPIO_Init(GPIOA, &GPIO_InitStructure);
+	GPIO_PinAFConfig(GPIOA, GPIO_PinSource0, GPIO_AF_TIM5);
 	
-	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM5, ENABLE);
 	/* Compute the prescaler value */
 	RCC_ClocksTypeDef clocks;
 	RCC_GetClocksFreq(&clocks);
@@ -80,14 +80,14 @@ void Timer3_init(void)
 	DMA_InitStructure.DMA_FIFOThreshold = DMA_FIFOThreshold_HalfFull;
 
 	DMA_InitStructure.DMA_Memory0BaseAddr = (uint32_t)&LED_BYTE_Buffer;		// this is the buffer memory 
-	DMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_HalfWord;
+	DMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_Word;
 	DMA_InitStructure.DMA_MemoryInc = DMA_MemoryInc_Enable;					// automatically increase buffer index
 	DMA_InitStructure.DMA_MemoryBurst = DMA_MemoryBurst_Single;
 
 	DMA_InitStructure.DMA_Mode = DMA_Mode_Normal;							// stop DMA feed after buffer size is reached
 
 	DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)&PWM_TIMER->CCR1;	// physical address of Timer 3 CCR1
-	DMA_InitStructure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_HalfWord;
+	DMA_InitStructure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Word;
 	DMA_InitStructure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
 	DMA_InitStructure.DMA_PeripheralBurst = DMA_PeripheralBurst_Single;
 
