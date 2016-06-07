@@ -1,3 +1,4 @@
+// Based on https://bitbucket.org/philpem/stm32f4_ws2811
 #include "application.h"
 
 #define d2r (3.14159265/180)
